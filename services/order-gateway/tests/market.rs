@@ -176,8 +176,8 @@ fn dbn_file_source_and_unknown_instrument() {
     gw.stop().unwrap();
 }
 
-/// A market order takes the touch, whatever its reference price: a buy the
-/// ask, a sell the bid.
+/// A market close takes the touch, whatever its reference price: a sell the bid.
+/// A market opening is refused, so the position is opened at a limit.
 #[test]
 fn market_orders_fill_at_the_touch() {
     let q = vec![quote(1, T0, Some(190), Some(200), 5)];
@@ -189,10 +189,7 @@ fn market_orders_fill_at_the_touch() {
     };
     run("market-type", "{}", &q, |c| {
         advance(c, T0);
-        let r = c.submit(
-            "r1",
-            &market(single("wse-m1", CALL, "buy", "open", 1, "1.00")),
-        );
+        let r = c.submit("r1", &single("wse-m1", CALL, "buy", "open", 1, "2.00"));
         assert_eq!(r["outcome"], "accepted", "{r}");
         let ev = advance(c, T0 + 10 * MS);
         assert_eq!(fill_price(&ev, "wse-m1").as_deref(), Some("2.00"));

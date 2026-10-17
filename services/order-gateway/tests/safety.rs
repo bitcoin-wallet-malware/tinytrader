@@ -91,20 +91,18 @@ fn each_cap_refuses_before_any_send() {
         cap(c.submit("n", &single("wse-n", CALL, "buy", "open", 10, "2.51"))),
         want("notional")
     );
-    // A market order's notional is its reference price's.
+    // A market opening is refused whatever its reference price, before the notional cap.
     let market = |s: String| {
         s.replace(
             r#""type":"limit","limit_price""#,
             r#""type":"market","ref_price""#,
         )
     };
-    assert_eq!(
-        cap(c.submit(
-            "nm",
-            &market(single("wse-nm", CALL, "buy", "open", 10, "2.51"))
-        )),
-        want("notional")
+    let r = c.submit(
+        "nm",
+        &market(single("wse-nm", CALL, "buy", "open", 10, "2.51")),
     );
+    assert_eq!(r["reason"], "market_opening_refused", "{r}");
     c.submit("a1", &buy("wse-a1"));
     c.submit("a2", &buy("wse-a2"));
     assert_eq!(cap(c.submit("o", &buy("wse-o"))), want("open_orders"));
@@ -274,8 +272,12 @@ fn stream_drop_degrades_then_resyncs_to_ready() {
         "cancels are allowed while degraded"
     );
     // The cancel happened while the stream was down; the 1 Hz poll or resync reports it.
+    // The stream can also deliver it first once it is back, so either source is correct.
     let o = c.order_event("wse-1", "canceled");
-    assert_eq!(o["source"], "rest_reconcile");
+    assert!(
+        matches!(o["source"].as_str(), Some("rest_reconcile" | "sim")),
+        "{o}"
+    );
     let st = c.event("status", |v| v.get("resync").is_some());
     assert_eq!(st["state"], "ready");
     assert_eq!(c.submit("r4", &buy("wse-4"))["outcome"], "accepted");
@@ -554,6 +556,79 @@ fn a_close_is_not_held_to_the_maximum_loss() {
     gw.stop().unwrap();
 }
 
+/// The market form of a single limit intent: `type` and `ref_price` replace the limit.
+fn market_of(s: String) -> String {
+    s.replace(
+        r#""type":"limit","limit_price""#,
+        r#""type":"market","ref_price""#,
+    )
+}
+
+#[test]
+fn a_market_opening_is_refused_and_never_sent() {
+    // 10 calls at a $1.25 reference price is $1,250, under the cap, but a market order
+    // fills at whatever the market gives: it is refused, and nothing is sent.
+    let gw = scripted(config(root("market-open")), &clocked_holding());
+    let mut c = Conn::open(&gw, "reactor", None);
+    let before = sends(&mut c, "s0");
+    let r = c.submit(
+        "m1",
+        &market_of(single("wse-m1", CALL, "buy", "open", 10, "1.25")),
+    );
+    assert_eq!(
+        (r["outcome"].as_str(), r["reason"].as_str()),
+        (Some("not_sent"), Some("market_opening_refused")),
+        "{r}"
+    );
+    assert_eq!(sends(&mut c, "s1"), before);
+    gw.stop().unwrap();
+}
+
+#[test]
+fn a_market_short_sale_of_stock_is_refused_even_when_shorts_are_allowed() {
+    let mut cfg = config(root("market-short"));
+    cfg.profile.equities = vec!["INTC".into()];
+    cfg.profile.allow_short = true;
+    let gw = scripted(cfg, &clocked());
+    let mut c = Conn::open(&gw, "reactor", None);
+    let before = sends(&mut c, "s0");
+    let intent = r#"{"client_order_id":"wse-ms","shape":"single","instrument":{"class":"equity","symbol":"INTC"},"side":"sell","effect":"open","qty":10,"type":"market","ref_price":"27.30","time_in_force":"day"}"#;
+    let r = c.submit("ms", intent);
+    assert_eq!(r["reason"], "market_opening_refused", "{r}");
+    assert_eq!(sends(&mut c, "s1"), before);
+    gw.stop().unwrap();
+}
+
+#[test]
+fn a_market_close_is_accepted_and_not_checked_against_the_cap() {
+    // A cap of one cent refuses any opening, so the close is accepted for its cap's sake.
+    let mut cfg = config(root("market-close"));
+    cfg.profile.max_notional_cents = 1;
+    let gw = scripted(cfg, &clocked_holding());
+    let mut c = Conn::open(&gw, "reactor", None);
+    let r = c.submit(
+        "mc",
+        &market_of(single("wse-mc", CALL, "sell", "close", 10, "2.51")),
+    );
+    assert_eq!(r["outcome"], "accepted", "{r}");
+    gw.stop().unwrap();
+}
+
+#[test]
+fn a_limit_opening_is_still_checked_against_the_notional_cap() {
+    // The limit form of the market opening above: 10 at $2.51 is $2,510, over the cap.
+    let gw = scripted(config(root("market-limit")), &clocked_holding());
+    let mut c = Conn::open(&gw, "reactor", None);
+    let r = c.submit("ln", &single("wse-ln", CALL, "buy", "open", 10, "2.51"));
+    assert_eq!(
+        (r["reason"].as_str(), r["detail"]["cap"].as_str()),
+        (Some("cap"), Some("notional")),
+        "{r}"
+    );
+    assert_eq!(c.submit("lo", &buy("wse-lo"))["outcome"], "accepted");
+    gw.stop().unwrap();
+}
+
 /// One day in nanoseconds: the next New York trading date after `T0` (a Monday, EDT).
 const DAY: u64 = 86_400_000_000_000;
 
@@ -645,7 +720,7 @@ fn a_closing_auction_order_left_unresolved_is_cleared_once_its_session_has_passe
 }
 
 #[test]
-fn a_day_and_a_closing_auction_order_from_a_prior_session_clear_on_the_same_poll() {
+fn a_day_and_a_closing_auction_order_from_a_prior_session_are_each_cleared() {
     let state = root("cls-and-day");
     // Two submits never reach the broker: a day option and a closing-auction stock.
     let script = format!(
@@ -667,10 +742,11 @@ fn a_day_and_a_closing_auction_order_from_a_prior_session_clear_on_the_same_poll
         v["client_order_id"] == "wse-cls" && v["outcome"] == "absent_after"
     });
     c.req("advance", "a1", &format!(r#""to_ts":{}"#, T0 + DAY));
-    // Both are past their session, and both are cleared on the same poll. Waiting on the
-    // unresolved count, not on each event, since an event read by one wait is not seen by the next.
+    // Both are past their session. One automatic clear runs per poll, so they clear on
+    // successive polls. Waiting on the unresolved count, not on each event, since an event
+    // read by one wait is not seen by the next.
     let mut q = c.req("open_orders", "q1", "").0;
-    for n in 0..40 {
+    for n in 0..100 {
         if q["unresolved"] == 0 {
             break;
         }

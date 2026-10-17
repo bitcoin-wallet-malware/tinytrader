@@ -255,7 +255,8 @@ fn a_failed_lookup_leaves_the_order_unknown_not_absent() {
             Act::Respond(500, Vec::new(), "{}".into()),
         );
     }
-    r.fake.reply("POST", "/v2/orders", 502, "<html>bad gateway</html>");
+    r.fake
+        .reply("POST", "/v2/orders", 502, "<html>bad gateway</html>");
     let v = c.submit("r1", &buy("wse-err"));
     assert_eq!(
         (v["outcome"].as_str(), v["reason"].as_str()),
@@ -383,6 +384,139 @@ fn a_404_never_clears_an_absent_order_however_many_checks_return_it() {
     let v = c.submit(
         "r3",
         &single("wse-404-close", CALL, "sell", "close", 1, "1.00"),
+    );
+    assert_eq!(v["reason"], "leg_pending");
+}
+
+/// A submit whose POST gets a 502 and whose every lookup fails with a 500: the order is
+/// unknown after its last lookup, and nothing is scheduled for it any more.
+fn unknown_submit_with_failed_lookups(r: &Rig, c: &mut Conn, cid: &str) {
+    for _ in 0..3 {
+        r.fake.next(
+            "GET",
+            "/v2/orders:by_client_order_id",
+            Act::Respond(500, Vec::new(), "{}".into()),
+        );
+    }
+    r.fake
+        .reply("POST", "/v2/orders", 502, "<html>bad gateway</html>");
+    let v = c.submit("r-unk", &buy(cid));
+    assert_eq!(v["outcome"], "unknown");
+    let res = c.event("resolution", |v| v["client_order_id"] == cid);
+    assert_eq!(res["outcome"], "unresolved");
+}
+
+/// The broker now has the order, in `status` with `filled` executed, with no stream event.
+fn broker_shows(r: &Rig, cid: &str, status: &str, filled: u64) {
+    r.fake.appear(&format!(
+        r#"{{"client_order_id":"{cid}","symbol":"{CALL}","qty":"1","side":"buy","limit_price":"1.25","position_intent":"buy_to_open"}}"#
+    ));
+    let mut st = r.fake.lock();
+    let o = st.orders.iter_mut().find(|o| o.cid == cid).unwrap();
+    o.status = status.into();
+    o.filled = filled;
+}
+
+/// An unknown order whose lookups all failed settles from the broker's terminal state
+/// found by the poll: it stops counting, and its leg closes.
+fn unknown_order_settles_on_a_terminal_state(status: &str, filled: u64) {
+    let name = format!("alpaca-unk-{status}");
+    let r = rig_with(&name, |p| p.max_open = 1);
+    let mut c = ready(&r.gw, "reactor");
+    r.fake.hold(&[(CALL, 1)]);
+    unknown_submit_with_failed_lookups(&r, &mut c, "wse-unk");
+    assert_eq!(
+        c.submit("r2", &buy("wse-next"))["detail"]["cap"],
+        "open_orders"
+    );
+    let v = c.submit(
+        "r3",
+        &single("wse-u-close", CALL, "sell", "close", 1, "1.00"),
+    );
+    assert_eq!(v["reason"], "leg_pending");
+    // Only the poll's lookup can settle it: no stream event is sent.
+    broker_shows(&r, "wse-unk", status, filled);
+    let o = c.order_event("wse-unk", normalized(status));
+    assert_eq!(o["source"], "rest_reconcile");
+    assert_eq!(o["status"], status);
+    let (q, _) = c.req("open_orders", "q1", "");
+    assert_eq!(q["unresolved"], 0);
+    // Its slot is free for an open on another leg, and its leg accepts a close.
+    let v = c.submit("r4", &single("wse-put", PUT_A, "buy", "open", 1, "1.00"));
+    assert_eq!(v["outcome"], "accepted", "{v}");
+    let v = c.submit(
+        "r5",
+        &single("wse-u-close2", CALL, "sell", "close", 1, "1.00"),
+    );
+    assert_eq!(v["outcome"], "accepted", "{v}");
+}
+
+/// The normalized `order` event a reconciled status is journaled as.
+fn normalized(status: &str) -> &'static str {
+    match status {
+        "filled" => "fill",
+        "canceled" => "canceled",
+        "new" => "new",
+        other => panic!("no event for {other}"),
+    }
+}
+
+#[test]
+fn an_unknown_order_the_broker_shows_filled_settles_and_frees_its_slot() {
+    unknown_order_settles_on_a_terminal_state("filled", 1);
+}
+
+#[test]
+fn an_unknown_order_the_broker_shows_canceled_settles_and_frees_its_slot() {
+    unknown_order_settles_on_a_terminal_state("canceled", 0);
+}
+
+#[test]
+fn a_404_alone_leaves_an_unknown_order_open_and_counted() {
+    let r = rig_with("alpaca-unk-404", |p| p.max_open = 1);
+    let mut c = ready(&r.gw, "reactor");
+    unknown_submit_with_failed_lookups(&r, &mut c, "wse-u404");
+    // The poll looks it up again, and the broker answers 404 each time.
+    let before = r.fake.count("GET", "/v2/orders:by_client_order_id");
+    let t = Instant::now();
+    while r.fake.count("GET", "/v2/orders:by_client_order_id") < before + 5 {
+        assert!(
+            t.elapsed() < Duration::from_secs(5),
+            "the poll never looked again"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let (q, _) = c.req("open_orders", "q1", "");
+    assert_eq!(q["unresolved"], 1);
+    assert_eq!(
+        c.submit("r2", &buy("wse-next"))["detail"]["cap"],
+        "open_orders"
+    );
+    let v = c.submit(
+        "r3",
+        &single("wse-u404-close", CALL, "sell", "close", 1, "1.00"),
+    );
+    assert_eq!(v["reason"], "leg_pending");
+}
+
+#[test]
+fn a_non_terminal_status_makes_an_unknown_order_an_ordinary_open_order() {
+    let r = rig_with("alpaca-unk-new", |p| p.max_open = 1);
+    let mut c = ready(&r.gw, "reactor");
+    unknown_submit_with_failed_lookups(&r, &mut c, "wse-unew");
+    broker_shows(&r, "wse-unew", "new", 0);
+    let o = c.order_event("wse-unew", "new");
+    assert_eq!(o["source"], "rest_reconcile");
+    // Open, not unresolved: it counts toward the cap and blocks its leg's close.
+    let (q, _) = c.req("open_orders", "q1", "");
+    assert_eq!(q["unresolved"], 0);
+    assert_eq!(
+        c.submit("r2", &buy("wse-next"))["detail"]["cap"],
+        "open_orders"
+    );
+    let v = c.submit(
+        "r3",
+        &single("wse-un-close", CALL, "sell", "close", 1, "1.00"),
     );
     assert_eq!(v["reason"], "leg_pending");
 }
