@@ -145,6 +145,9 @@ fn close_on(cid: &str, symbol: &str) -> String {
 const FAR: &str = "SPY261005C00590000";
 const CALL_585: &str = "SPY261005C00585000";
 const PUT_C: &str = "SPY261005P00565000";
+/// A 575 call, and the 580 call of a November expiry (a calendar with the 580 call).
+const CALL_575: &str = "SPY261005C00575000";
+const CALL_580_NOV: &str = "SPY261012C00580000";
 
 #[test]
 fn a_close_is_not_counted_toward_the_daily_cap() {
@@ -523,21 +526,72 @@ fn a_naked_short_call_is_refused_as_unbounded() {
 }
 
 #[test]
-fn a_shape_without_a_bound_is_refused_as_unknown() {
-    // A butterfly with its middle ratio at 2 is not two verticals: no bound is claimed.
+fn a_butterfly_is_held_to_its_bounded_loss() {
+    // Buy 575, sell two 580, buy 585 calls for $1.00: a loss of $1.00 a share, $100 a
+    // contract. The $1,000 cap admits 10 (exactly $1,000) and refuses 11 ($1,100).
+    let mut cfg = config(root("max-loss-fly"));
+    cfg.profile.max_notional_cents = 100_000;
+    let gw = scripted(cfg, &clocked_holding());
+    let mut c = Conn::open(&gw, "reactor", None);
+    let fly = |cid: &str, qty: u32| {
+        combo(
+            cid,
+            &[
+                (CALL_575, 1, "buy", "open"),
+                (CALL_585, 2, "sell", "open"),
+                (FAR, 1, "buy", "open"),
+            ],
+            qty,
+            "1.00",
+        )
+    };
+    assert_eq!(
+        cap_name(&c.submit("f11", &fly("wse-f11", 11))),
+        Some("notional".into())
+    );
+    assert_eq!(c.submit("f10", &fly("wse-f10", 10))["outcome"], "accepted");
+    gw.stop().unwrap();
+}
+
+#[test]
+fn an_unbounded_ratio_spread_is_refused_as_unbounded() {
+    // Buy one 575 call, sell two 585 calls: above 585 the payoff falls $1 a dollar.
+    let gw = scripted(config(root("max-loss-ratio")), &clocked_holding());
+    let mut c = Conn::open(&gw, "reactor", None);
+    let r = c.submit(
+        "r1",
+        &combo(
+            "wse-r1",
+            &[(CALL_575, 1, "buy", "open"), (CALL_585, 2, "sell", "open")],
+            1,
+            "1.00",
+        ),
+    );
+    assert_eq!(r["reason"], "max_loss_unbounded", "{r}");
+    gw.stop().unwrap();
+}
+
+#[test]
+fn a_roll_and_a_calendar_are_refused_as_unknown() {
+    // A roll closes the held 580 call and opens the 585: one limit prices both legs.
     let gw = scripted(config(root("max-loss-unknown")), &clocked_holding());
     let mut c = Conn::open(&gw, "reactor", None);
-    let fly = combo(
-        "wse-fly",
-        &[
-            (CALL, 1, "buy", "open"),
-            (CALL_585, 2, "sell", "open"),
-            (FAR, 1, "buy", "open"),
-        ],
+    let roll = combo(
+        "wse-roll",
+        &[(CALL, 1, "sell", "close"), (CALL_585, 1, "buy", "open")],
         1,
         "1.00",
     );
-    let r = c.submit("f1", &fly);
+    let r = c.submit("roll", &roll);
+    assert_eq!(r["reason"], "max_loss_unknown", "{r}");
+    // A calendar: the 580 calls of two expiries.
+    let cal = combo(
+        "wse-cal",
+        &[(CALL, 1, "buy", "open"), (CALL_580_NOV, 1, "sell", "open")],
+        1,
+        "1.00",
+    );
+    let r = c.submit("cal", &cal);
     assert_eq!(r["reason"], "max_loss_unknown", "{r}");
     gw.stop().unwrap();
 }
